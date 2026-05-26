@@ -13,6 +13,9 @@ DEFAULT_OUTPUT_DIR = Path("output")
 DEFAULT_MAX_CAMERAS = 10
 DEFAULT_DIAGNOSTIC_FRAMES = 30
 DEFAULT_BLACK_FRAME_THRESHOLD = 3.0
+DEFAULT_CAMERA_WIDTH = 1920
+DEFAULT_CAMERA_HEIGHT = 1080
+DEFAULT_CAMERA_FOURCC = "MJPG"
 
 
 def load_cv2():
@@ -62,6 +65,53 @@ def get_backend(cv2, backend_name):
         raise SystemExit(f"Unknown backend '{backend_name}'. Available: {available}")
 
     return backends[resolved_name]
+
+
+def normalize_fourcc(fourcc):
+    if fourcc is None:
+        return None
+
+    normalized = fourcc.strip().upper()
+    if normalized in {"", "NONE", "AUTO"}:
+        return None
+
+    if len(normalized) != 4:
+        raise SystemExit("--fourcc must be 4 characters, or 'none' to disable it.")
+
+    return normalized
+
+
+def apply_capture_settings(cv2, capture, width=None, height=None, fps=None, fourcc=None):
+    fourcc = normalize_fourcc(fourcc)
+
+    if fourcc:
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+
+    if width:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+
+    if height:
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    if fps:
+        capture.set(cv2.CAP_PROP_FPS, fps)
+
+
+def capture_properties(cv2, capture):
+    fourcc_value = int(capture.get(cv2.CAP_PROP_FOURCC))
+    fourcc_chars = [chr((fourcc_value >> 8 * i) & 0xFF) for i in range(4)]
+    fourcc = "".join(fourcc_chars).strip("\x00").strip()
+    if len(fourcc) != 4 or not all(32 <= ord(char) <= 126 for char in fourcc):
+        fourcc = None
+
+    fps = capture.get(cv2.CAP_PROP_FPS)
+
+    return {
+        "width": int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "fps": fps if fps and fps > 0 else None,
+        "fourcc": fourcc,
+    }
 
 
 def scan_backend_names(cv2, backend_name):
@@ -184,7 +234,16 @@ def get_camera_names():
     return []
 
 
-def probe_camera(cv2, index, name=None, backend_name="auto"):
+def probe_camera(
+    cv2,
+    index,
+    name=None,
+    backend_name="auto",
+    width=None,
+    height=None,
+    fps=None,
+    fourcc=None,
+):
     with suppress_native_stderr():
         capture = cv2.VideoCapture(index, get_backend(cv2, backend_name))
 
@@ -192,27 +251,36 @@ def probe_camera(cv2, index, name=None, backend_name="auto"):
         if not capture.isOpened():
             return None
 
+        apply_capture_settings(cv2, capture, width, height, fps, fourcc)
+
         ok, _ = capture.read()
         if not ok:
             return None
 
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = capture.get(cv2.CAP_PROP_FPS)
+        properties = capture_properties(cv2, capture)
 
         return {
             "index": index,
             "name": name or f"Camera {index}",
             "backend": resolve_backend_name(backend_name),
-            "width": width,
-            "height": height,
-            "fps": fps if fps and fps > 0 else None,
+            "width": properties["width"],
+            "height": properties["height"],
+            "fps": properties["fps"],
+            "fourcc": properties["fourcc"],
         }
     finally:
         capture.release()
 
 
-def list_cameras(cv2, max_cameras, backend_name="auto"):
+def list_cameras(
+    cv2,
+    max_cameras,
+    backend_name="auto",
+    width=None,
+    height=None,
+    fps=None,
+    fourcc=None,
+):
     cameras = []
     camera_names = get_camera_names()
     backend_names = scan_backend_names(cv2, backend_name)
@@ -226,7 +294,16 @@ def list_cameras(cv2, max_cameras, backend_name="auto"):
     for current_backend_name in backend_names:
         for index in range(max_cameras):
             name = camera_names[index] if index < len(camera_names) else None
-            camera = probe_camera(cv2, index, name, current_backend_name)
+            camera = probe_camera(
+                cv2,
+                index,
+                name,
+                current_backend_name,
+                width,
+                height,
+                fps,
+                fourcc,
+            )
             if camera:
                 pair = (camera["index"], camera["backend"])
                 if pair not in found_pairs:
@@ -243,10 +320,11 @@ def print_cameras(cameras, detected_names=None):
         print("\nAvailable webcams:")
         for camera in cameras:
             fps_text = f", {camera['fps']:.1f} FPS" if camera["fps"] else ""
+            fourcc_text = f", {camera['fourcc']}" if camera.get("fourcc") else ""
             print(
                 f"  [{camera['index']}] {camera['name']} "
                 f"backend={camera['backend']} "
-                f"({camera['width']}x{camera['height']}{fps_text})"
+                f"({camera['width']}x{camera['height']}{fps_text}{fourcc_text})"
             )
 
     if detected_names:
@@ -280,7 +358,15 @@ def ask_for_camera_index(cameras):
         print(f"Camera {selected_index} is not in the available webcam list.")
 
 
-def open_camera(cv2, camera_index, backend_name):
+def open_camera(
+    cv2,
+    camera_index,
+    backend_name,
+    width=None,
+    height=None,
+    fps=None,
+    fourcc=None,
+):
     capture = cv2.VideoCapture(camera_index, get_backend(cv2, backend_name))
 
     if not capture.isOpened():
@@ -288,6 +374,8 @@ def open_camera(cv2, camera_index, backend_name):
         raise RuntimeError(
             f"Cannot open webcam index {camera_index} with backend '{resolved_backend}'."
         )
+
+    apply_capture_settings(cv2, capture, width, height, fps, fourcc)
 
     return capture
 
@@ -310,7 +398,10 @@ def capture_image(cv2, capture, output_dir):
     if frame is None:
         ok, frame = capture.read()
         if not ok:
-            raise RuntimeError("Could not read an image from the selected webcam.")
+            raise RuntimeError(
+                "Could not read an image from the selected webcam. "
+                "Try --fourcc none or a lower --width/--height value."
+            )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     file_path = output_dir / image_filename()
@@ -318,7 +409,7 @@ def capture_image(cv2, capture, output_dir):
     if not cv2.imwrite(str(file_path), frame):
         raise RuntimeError(f"Could not save image to {file_path}.")
 
-    return file_path
+    return file_path, frame_stats(frame)
 
 
 def frame_stats(frame):
@@ -332,12 +423,27 @@ def frame_stats(frame):
     }
 
 
+def properties_text(properties):
+    fps_text = f", {properties['fps']:.1f} FPS" if properties.get("fps") else ""
+    fourcc_text = f", {properties['fourcc']}" if properties.get("fourcc") else ""
+    return f"{properties['width']}x{properties['height']}{fps_text}{fourcc_text}"
+
+
 def diagnostic_filename(camera_index, backend_name, frame_number):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return f"diagnose_cam{camera_index}_{backend_name}_frame{frame_number}_{timestamp}.jpg"
 
 
-def diagnose_camera(cv2, camera_index, output_dir, frames_to_try):
+def diagnose_camera(
+    cv2,
+    camera_index,
+    output_dir,
+    frames_to_try,
+    width=None,
+    height=None,
+    fps=None,
+    fourcc=None,
+):
     diagnostic_dir = output_dir / "diagnostics"
     diagnostic_dir.mkdir(parents=True, exist_ok=True)
 
@@ -358,6 +464,8 @@ def diagnose_camera(cv2, camera_index, output_dir, frames_to_try):
             if not capture.isOpened():
                 print("  open: failed")
                 continue
+
+            apply_capture_settings(cv2, capture, width, height, fps, fourcc)
 
             best_frame = None
             best_stats = None
@@ -393,6 +501,8 @@ def diagnose_camera(cv2, camera_index, output_dir, frames_to_try):
                 else "has visible data"
             )
             print(f"  read: {successful_reads}/{frames_to_try} frames")
+            active_settings = properties_text(capture_properties(cv2, capture))
+            print(f"  active settings: {active_settings}")
             print(
                 "  best frame: "
                 f"{best_stats['width']}x{best_stats['height']}, "
@@ -426,13 +536,19 @@ def run_capture_loop(
     capture_now,
     backend_name,
     once,
+    width=None,
+    height=None,
+    fps=None,
+    fourcc=None,
 ):
-    capture = open_camera(cv2, camera_index, backend_name)
+    capture = open_camera(cv2, camera_index, backend_name, width, height, fps, fourcc)
     resolved_backend = resolve_backend_name(backend_name)
 
     try:
         print(f"[{now_text()}] Using webcam index {camera_index}.")
         print(f"[{now_text()}] Backend: {resolved_backend}.")
+        active_settings = properties_text(capture_properties(cv2, capture))
+        print(f"[{now_text()}] Active camera settings: {active_settings}.")
         print(f"[{now_text()}] Images will be saved to: {output_dir.resolve()}")
         print(f"[{now_text()}] Capture interval: {interval_seconds} seconds.")
         print("Press Ctrl+C to stop.\n")
@@ -443,8 +559,11 @@ def run_capture_loop(
 
         while True:
             try:
-                file_path = capture_image(cv2, capture, output_dir)
-                print(f"[{now_text()}] Saved: {file_path}")
+                file_path, stats = capture_image(cv2, capture, output_dir)
+                print(
+                    f"[{now_text()}] Saved: {file_path} "
+                    f"({stats['width']}x{stats['height']})"
+                )
             except Exception as exc:
                 print(f"[{now_text()}] Capture failed: {exc}")
 
@@ -498,6 +617,32 @@ def parse_args():
         help=f"Number of webcam indexes to scan. Default: {DEFAULT_MAX_CAMERAS}.",
     )
     parser.add_argument(
+        "--width",
+        type=int,
+        default=DEFAULT_CAMERA_WIDTH,
+        help=f"Requested camera width. Default: {DEFAULT_CAMERA_WIDTH}.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=DEFAULT_CAMERA_HEIGHT,
+        help=f"Requested camera height. Default: {DEFAULT_CAMERA_HEIGHT}.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Requested camera FPS. If omitted, the driver default is used.",
+    )
+    parser.add_argument(
+        "--fourcc",
+        default=DEFAULT_CAMERA_FOURCC,
+        help=(
+            "Requested camera pixel format. Use 'none' to disable. "
+            f"Default: {DEFAULT_CAMERA_FOURCC}."
+        ),
+    )
+    parser.add_argument(
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL_SECONDS,
@@ -535,8 +680,27 @@ def main():
     if args.diagnostic_frames <= 0:
         raise SystemExit("--diagnostic-frames must be greater than 0.")
 
+    if args.width <= 0:
+        raise SystemExit("--width must be greater than 0.")
+
+    if args.height <= 0:
+        raise SystemExit("--height must be greater than 0.")
+
+    if args.fps is not None and args.fps <= 0:
+        raise SystemExit("--fps must be greater than 0.")
+
+    args.fourcc = normalize_fourcc(args.fourcc)
+
     cv2 = load_cv2()
-    cameras = list_cameras(cv2, args.max_cameras, args.backend)
+    cameras = list_cameras(
+        cv2,
+        args.max_cameras,
+        args.backend,
+        args.width,
+        args.height,
+        args.fps,
+        args.fourcc,
+    )
     camera_names = get_camera_names()
     print_cameras(cameras, camera_names)
 
@@ -560,7 +724,16 @@ def main():
         selected_backend_name = selected_camera["backend"]
 
     if args.diagnose:
-        diagnose_camera(cv2, camera_index, args.output, args.diagnostic_frames)
+        diagnose_camera(
+            cv2,
+            camera_index,
+            args.output,
+            args.diagnostic_frames,
+            args.width,
+            args.height,
+            args.fps,
+            args.fourcc,
+        )
         return
 
     try:
@@ -572,6 +745,10 @@ def main():
             capture_now=not args.no_initial_capture,
             backend_name=selected_backend_name,
             once=args.once,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            fourcc=args.fourcc,
         )
     except KeyboardInterrupt:
         print(f"\n[{now_text()}] Stopped.")
